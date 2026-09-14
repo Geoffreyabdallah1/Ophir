@@ -161,10 +161,31 @@ def to_yahoo(ticker: str) -> str:
     return f"{ticker}.AX"
 
 
+def _extract(raw: pd.DataFrame, symbol: str) -> pd.DataFrame | None:
+    """Pull one ticker's block out of a yfinance frame, whichever way it grouped.
+
+    group_by="ticker" puts the symbol on level 0 and the field on level 1;
+    the column-grouped default is the other way round, and which one comes back
+    has varied across yfinance releases. Find the symbol on whichever level holds it.
+    """
+    if not isinstance(raw.columns, pd.MultiIndex):
+        return raw
+    for level in range(raw.columns.nlevels):
+        if symbol in raw.columns.get_level_values(level):
+            return raw.xs(symbol, axis=1, level=level)
+    return None
+
+
 def _tidy(frame: pd.DataFrame) -> pd.DataFrame | None:
     """Coerce a yfinance frame into lower-case OHLCV indexed by date."""
     frame = frame.rename(columns={c: _normalise_header(c) for c in frame.columns})
-    frame = frame.rename(columns={"adj close": "close"})
+    # With auto_adjust=True the close is already adjusted and an extra "Adj Close"
+    # may still ride along. Renaming it blindly would leave two columns called
+    # "close", and frame["close"] would then hand back a DataFrame, not a Series.
+    if "adj close" in frame.columns:
+        frame = (frame.drop(columns=["adj close"]) if "close" in frame.columns
+                 else frame.rename(columns={"adj close": "close"}))
+    frame = frame.loc[:, ~frame.columns.duplicated()]
     if not set(PRICE_COLUMNS).issubset(frame.columns):
         return None
     frame = frame[PRICE_COLUMNS].apply(pd.to_numeric, errors="coerce")
@@ -233,12 +254,9 @@ def download_prices(tickers: list[str], start: date, end: date, batch_size: int 
             continue
 
         for ticker, symbol in zip(batch, symbols):
-            if isinstance(raw.columns, pd.MultiIndex):
-                if symbol not in raw.columns.get_level_values(0):
-                    continue
-                block = raw[symbol]
-            else:
-                block = raw
+            block = _extract(raw, symbol)
+            if block is None:
+                continue
             tidy = _tidy(block)
             if tidy is not None:
                 out[ticker] = tidy

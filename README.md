@@ -95,5 +95,8 @@ python -m unittest discover -s tests
 
 The signal engine is tested against synthetic series — breakouts, breakdowns,
 volume confirmation, the channel excluding today's own bar, RSI bounds, turnover,
-the liquidity gate, universe parsing and the top-N exclusion. The `yfinance`
-download path is not covered, since it needs live network access.
+the liquidity gate, universe parsing and the top-N exclusion. The frame reshaping
+that sits between `yfinance` and the signal pass is covered too: both MultiIndex
+column orderings, a single flat-column ticker, a partly failed batch, and an
+`Adj Close` column arriving alongside `Close`. The network call itself is not
+covered, since it needs live access to Yahoo.

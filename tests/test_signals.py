@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from asx_breakout_scan import (  # noqa: E402
     ScanConfig,
+    _extract,
+    _tidy,
     compute_signals,
     load_universe,
     parse_market_cap,
@@ -244,6 +246,68 @@ class TestUniverse(unittest.TestCase):
         self.assertEqual(parse_market_cap(4200), 4200.0)
         self.assertTrue(np.isnan(parse_market_cap("")))
         self.assertTrue(np.isnan(parse_market_cap("n/a")))
+
+
+class TestYfinanceFrameShapes(unittest.TestCase):
+    """The download path itself needs live network, but the frame reshaping does not."""
+
+    def _fields(self):
+        index = pd.bdate_range("2024-01-02", periods=3)
+        return index, {"Open": [1.0, 2.0, 3.0], "High": [1.1, 2.1, 3.1],
+                       "Low": [0.9, 1.9, 2.9], "Close": [1.0, 2.0, 3.0],
+                       "Volume": [10.0, 20.0, 30.0]}
+
+    def test_extract_ticker_major_columns(self):
+        index, fields = self._fields()
+        columns = pd.MultiIndex.from_product([["AAA.AX", "BBB.AX"], list(fields)])
+        raw = pd.DataFrame(
+            {(t, f): v for t in ("AAA.AX", "BBB.AX") for f, v in fields.items()},
+            index=index, columns=columns)
+        block = _extract(raw, "BBB.AX")
+        self.assertEqual(list(block.columns), list(fields))
+
+    def test_extract_field_major_columns(self):
+        index, fields = self._fields()
+        raw = pd.DataFrame(
+            {(f, t): v for f, v in fields.items() for t in ("AAA.AX", "BBB.AX")},
+            index=index)
+        block = _extract(raw, "AAA.AX")
+        self.assertEqual(sorted(block.columns), sorted(fields))
+
+    def test_extract_single_ticker_flat_columns(self):
+        index, fields = self._fields()
+        raw = pd.DataFrame(fields, index=index)
+        self.assertIs(_extract(raw, "AAA.AX"), raw)
+
+    def test_extract_missing_ticker(self):
+        index, fields = self._fields()
+        columns = pd.MultiIndex.from_product([["AAA.AX"], list(fields)])
+        raw = pd.DataFrame({("AAA.AX", f): v for f, v in fields.items()},
+                           index=index, columns=columns)
+        self.assertIsNone(_extract(raw, "ZZZ.AX"))
+
+    def test_adj_close_alongside_close_is_dropped(self):
+        # auto_adjust=True can still ship an extra Adj Close column. Renaming it
+        # blindly would leave two "close" columns and break every downstream Series op.
+        index, fields = self._fields()
+        fields["Adj Close"] = [0.5, 1.5, 2.5]
+        tidy = _tidy(pd.DataFrame(fields, index=index))
+        self.assertEqual(list(tidy.columns).count("close"), 1)
+        self.assertIsInstance(tidy["close"], pd.Series)
+        self.assertEqual(tidy["close"].tolist(), [1.0, 2.0, 3.0])
+
+    def test_adj_close_only_becomes_close(self):
+        index, fields = self._fields()
+        del fields["Close"]
+        fields["Adj Close"] = [0.5, 1.5, 2.5]
+        tidy = _tidy(pd.DataFrame(fields, index=index))
+        self.assertEqual(tidy["close"].tolist(), [0.5, 1.5, 2.5])
+
+    def test_all_nan_ticker_is_dropped(self):
+        # A ticker that failed inside an otherwise good batch comes back as NaN.
+        index, fields = self._fields()
+        fields["Close"] = [float("nan")] * 3
+        self.assertIsNone(_tidy(pd.DataFrame(fields, index=index)))
 
 
 class TestSectorStrength(unittest.TestCase):
