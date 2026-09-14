@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Scan output and cached data
+asx_breakout_scan_*.xlsx
+*.xlsx
+prices*.csv
+asx_universe.csv
