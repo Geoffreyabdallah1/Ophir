@@ -13,7 +13,18 @@ pip install -r requirements.txt
 python asx_breakout_scan.py --universe asx_universe.csv
 ```
 
-That writes `asx_breakout_scan_YYYY-MM-DD.xlsx` in the working directory.
+That writes `asx_breakout_scan_YYYY-MM-DD.xlsx` in the working directory. The
+universe can be as little as a text file of ASX codes, one per line:
+
+```bash
+printf 'SXE\nSLC\nIPG\nVEA\nLOV\n' > watchlist.csv
+python asx_breakout_scan.py --universe watchlist.csv --exclude-top 0
+```
+
+Price history is downloaded from Yahoo Finance, so the machine running this needs
+outbound access to `query1.finance.yahoo.com`, `query2.finance.yahoo.com` and
+`fc.yahoo.com`. On a restricted network the download fails with
+`CONNECT tunnel failed, response 403` and no prices come back.
 
 ## The universe file
 
@@ -28,11 +39,24 @@ work, as do `Company name` / `Name`, `GICS industry group` / `Sector`, and
 
 - Anything that isn't a three-character ordinary line is dropped, so options,
   rights, warrants and notes never reach the scan.
-- The largest `--exclude-top` names by market cap are dropped. The default is
-  100, so "ex-100" is computed from the data rather than depending on a stale
-  index list. `--exclude-top 200` gives you ex-200.
+- The largest `--exclude-top` names are dropped. The default is 100, so "ex-100"
+  is computed from the data rather than depending on a stale index list.
+  `--exclude-top 200` gives you ex-200, and `--exclude-top 0` scans everything.
 - Names with no market cap are treated as small and stay in — a blank field
   never knocks a genuine small-cap out.
+
+If the file has no market cap column at all — a bare list of codes, say — the
+top-N cut falls back to 60-day average turnover, which is a serviceable proxy
+for size and needs no extra data. `--rank-by` forces the choice:
+
+| Value | Behaviour |
+| --- | --- |
+| `auto` (default) | Market cap when the file carries enough of it, else turnover. |
+| `market-cap` | Always market cap. Nothing is dropped if the column is missing. |
+| `turnover` | Always 60-day average daily turnover, computed from the price data. |
+
+Turnover ranking happens after the download, since it needs the prices; the run
+log says which basis was used.
 
 ## Signals
 
@@ -45,7 +69,7 @@ work, as do `Company name` / `Name`, `GICS industry group` / `Sector`, and
 | RSI14 | Wilder's RSI. |
 | Returns | 5, 21 and 63 session price change. |
 | 52-week extremes | Distance from the trailing 252-session high and low, plus a new-high/new-low flag tested against today's own intraday high and low. |
-| ADV20 | 20-day average daily turnover in A$. |
+| ADV20 / ADV60 | 20- and 60-day average daily turnover in A$. The 60-day figure rides out a single block trade or capital raising, which is why the size ranking uses it. |
 
 The channel is built from intraday highs and lows rather than closes, so a close
 that clears the prior range is a genuine break of the level, not just a
@@ -95,7 +119,8 @@ python -m unittest discover -s tests
 
 The signal engine is tested against synthetic series — breakouts, breakdowns,
 volume confirmation, the channel excluding today's own bar, RSI bounds, turnover,
-the liquidity gate, universe parsing and the top-N exclusion. The frame reshaping
+the liquidity gate, universe parsing, the top-N exclusion on either basis, and
+workbook writing with empty columns. The frame reshaping
 that sits between `yfinance` and the signal pass is covered too: both MultiIndex
 column orderings, a single flat-column ticker, a partly failed batch, and an
 `Adj Close` column arriving alongside `Close`. The network call itself is not

@@ -99,9 +99,18 @@ def load_universe(source: str | Path, exclude_top: int = 100) -> tuple[pd.DataFr
 
     ticker_col = _find_column(columns, TICKER_ALIASES)
     if ticker_col is None:
+        # A bare list of codes, one per line, has no header to detect.
+        bare = pd.read_csv(source, dtype=str, header=None)
+        codes = bare.iloc[:, 0].fillna("").astype(str).str.strip()
+        if bare.shape[1] == 1 and codes.str.match(r"^[A-Za-z0-9]{2,6}$").all():
+            raw = pd.DataFrame({"Ticker": codes})
+            columns = {"ticker": "Ticker"}
+            ticker_col = "Ticker"
+    if ticker_col is None:
         raise ValueError(
             f"No ticker column found in {source}. Looked for one of: "
             + ", ".join(TICKER_ALIASES)
+            + " — or supply a bare list of codes, one per line."
         )
     name_col = _find_column(columns, NAME_ALIASES)
     sector_col = _find_column(columns, SECTOR_ALIASES)
@@ -131,16 +140,10 @@ def load_universe(source: str | Path, exclude_top: int = 100) -> tuple[pd.DataFr
         excluded.append(non_ordinary)
     frame = frame[frame["Ticker"].str.match(ORDINARY_RE)].copy()
 
-    if exclude_top > 0 and not frame.empty:
-        # Names without a market cap cannot be ranked; treat them as small so a
-        # missing value never knocks a genuine small-cap out of the scan.
-        ranked = frame.sort_values("MarketCap", ascending=False, na_position="last")
-        top = ranked.head(exclude_top).copy()
-        top = top[top["MarketCap"].notna()]
+    if exclude_top > 0:
+        frame, top = exclude_largest(frame, exclude_top, "MarketCap", "market cap")
         if not top.empty:
-            top["Reason"] = f"Top {exclude_top} by market cap"
             excluded.append(top)
-            frame = frame[~frame["Ticker"].isin(top["Ticker"])].copy()
 
     excluded_frame = (
         pd.concat(excluded, ignore_index=True)
@@ -148,6 +151,32 @@ def load_universe(source: str | Path, exclude_top: int = 100) -> tuple[pd.DataFr
         else pd.DataFrame(columns=["Ticker", "Name", "Sector", "MarketCap", "Reason"])
     )
     return frame.reset_index(drop=True), excluded_frame
+
+
+def exclude_largest(frame: pd.DataFrame, exclude_top: int, column: str,
+                    label: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Drop the `exclude_top` largest rows by `column`. Returns (kept, dropped).
+
+    Rows with no value in `column` cannot be ranked and are treated as small, so a
+    blank field never knocks a genuine small-cap out of the scan.
+    """
+    if exclude_top <= 0 or frame.empty or column not in frame.columns:
+        return frame.reset_index(drop=True), pd.DataFrame(columns=[*frame.columns, "Reason"])
+    ranked = frame.sort_values(column, ascending=False, na_position="last")
+    top = ranked.head(exclude_top).copy()
+    top = top[top[column].notna()]
+    if top.empty:
+        return frame.reset_index(drop=True), pd.DataFrame(columns=[*frame.columns, "Reason"])
+    top["Reason"] = f"Top {exclude_top} by {label}"
+    kept = frame[~frame["Ticker"].isin(top["Ticker"])].copy()
+    return kept.reset_index(drop=True), top.reset_index(drop=True)
+
+
+def has_usable_market_cap(frame: pd.DataFrame, needed: int) -> bool:
+    """True when enough names carry a market cap to rank a top-N cut by it."""
+    if "MarketCap" not in frame.columns:
+        return False
+    return int(frame["MarketCap"].notna().sum()) >= max(needed, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -336,8 +365,11 @@ def compute_signals(frame: pd.DataFrame, cfg: ScanConfig) -> dict | None:
                     else float("nan"))
     confirmed = bool(np.isfinite(volume_ratio) and volume_ratio >= cfg.volume_multiple)
 
-    turnover = (close * volume).rolling(20).mean()
-    adv20 = _last(turnover)
+    turnover = close * volume
+    adv20 = _last(turnover.rolling(20).mean())
+    # ADV20 is too noisy to rank a whole universe on; 60 sessions rides out a
+    # single block trade or a capital raising.
+    adv60 = _last(turnover.rolling(60, min_periods=20).mean())
 
     ma20, ma50, ma200 = (close.rolling(w).mean() for w in (20, 50, 200))
     last_ma20, last_ma50, last_ma200 = _last(ma20), _last(ma50), _last(ma200)
@@ -368,6 +400,7 @@ def compute_signals(frame: pd.DataFrame, cfg: ScanConfig) -> dict | None:
         "Close": last_close,
         "Volume": last_volume,
         "ADV20 (A$)": adv20,
+        "ADV60 (A$)": adv60,
         "Breakout": breakout,
         "Breakdown": breakdown,
         "Confirmed": confirmed,
@@ -475,8 +508,11 @@ def write_workbook(path: Path, breakouts: pd.DataFrame, breakdowns: pd.DataFrame
             sheet = writer.sheets[name]
             sheet.freeze_panes = "A2"
             for idx, column in enumerate(out.columns, start=1):
-                values = out[column].astype(str)
-                width = max(len(str(column)), int(values.str.len().max() or 0)) + 2
+                # An all-empty column (no company names, no market caps) gives a
+                # NaN max, which int() will not take.
+                longest = out[column].astype(str).str.len().max()
+                longest = int(longest) if pd.notna(longest) else 0
+                width = max(len(str(column)), longest) + 2
                 sheet.column_dimensions[
                     sheet.cell(row=1, column=idx).column_letter
                 ].width = min(max(width, 9), 42)
@@ -496,7 +532,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="CSV of listed companies (ticker, name, sector, market cap); "
                              "a local path or an http(s) URL")
     parser.add_argument("--exclude-top", type=int, default=100,
-                        help="Drop the N largest names by market cap")
+                        help="Drop the N largest names")
+    parser.add_argument("--rank-by", choices=("auto", "market-cap", "turnover"),
+                        default="auto",
+                        help="What 'largest' means for --exclude-top. 'auto' uses market "
+                             "cap when the universe file carries it, else 60-day turnover")
     parser.add_argument("--min-adv", type=float, default=250_000.0,
                         help="Minimum 20-day average daily turnover in A$ to be signalled")
     parser.add_argument("--donchian", type=int, default=60,
@@ -525,7 +565,21 @@ def main(argv: list[str] | None = None) -> int:
     cfg = ScanConfig(donchian=args.donchian, volume_multiple=args.volume_multiple,
                      min_adv=args.min_adv)
 
-    universe, excluded = load_universe(args.universe, exclude_top=args.exclude_top)
+    # Resolve how "largest" is measured before deciding what to drop. Ranking by
+    # turnover has to wait until prices are in hand, so only the market-cap cut
+    # can happen here.
+    universe, excluded = load_universe(args.universe, exclude_top=0)
+    rank_by = args.rank_by
+    if rank_by == "auto":
+        rank_by = ("market-cap" if has_usable_market_cap(universe, args.exclude_top)
+                   else "turnover")
+        print(f"Ranking the top {args.exclude_top} by {rank_by} (auto-detected)",
+              file=sys.stderr)
+    if rank_by == "market-cap":
+        universe, top = exclude_largest(universe, args.exclude_top, "MarketCap", "market cap")
+        if not top.empty:
+            excluded = pd.concat([excluded, top], ignore_index=True)
+
     if args.limit:
         universe = universe.head(args.limit).copy()
     print(f"Universe: {len(universe)} names to scan, {len(excluded)} excluded",
@@ -552,6 +606,15 @@ def main(argv: list[str] | None = None) -> int:
     if results.empty:
         print("No names had enough history to scan.", file=sys.stderr)
         return 1
+
+    if rank_by == "turnover":
+        results, top = exclude_largest(results, args.exclude_top, "ADV60 (A$)",
+                                       "60-day turnover")
+        if not top.empty:
+            excluded = pd.concat(
+                [excluded, top[["Ticker", "Name", "Sector", "MarketCap", "Reason"]]],
+                ignore_index=True)
+        print(f"Dropped {len(top)} names on 60-day turnover", file=sys.stderr)
 
     breakouts = _signal_table(results, "Breakout", cfg)
     breakdowns = _signal_table(results, "Breakdown", cfg)

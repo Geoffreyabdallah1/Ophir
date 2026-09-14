@@ -19,8 +19,11 @@ from asx_breakout_scan import (  # noqa: E402
     _extract,
     _tidy,
     compute_signals,
+    exclude_largest,
+    has_usable_market_cap,
     load_universe,
     parse_market_cap,
+    write_workbook,
     rsi,
     scan,
     sector_strength,
@@ -246,6 +249,75 @@ class TestUniverse(unittest.TestCase):
         self.assertEqual(parse_market_cap(4200), 4200.0)
         self.assertTrue(np.isnan(parse_market_cap("")))
         self.assertTrue(np.isnan(parse_market_cap("n/a")))
+
+
+class TestRankingFallback(unittest.TestCase):
+    """--exclude-top must still work when the universe file carries no market cap."""
+
+    def test_bare_ticker_list_is_accepted(self):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False)
+        handle.write("BHP\nCBA\nXYZ\n")
+        handle.close()
+        universe, _ = load_universe(Path(handle.name), exclude_top=0)
+        self.assertEqual(universe["Ticker"].tolist(), ["BHP", "CBA", "XYZ"])
+        self.assertTrue(universe["MarketCap"].isna().all())
+        self.assertEqual(universe["Sector"].unique().tolist(), ["Unclassified"])
+
+    def test_has_usable_market_cap(self):
+        frame = pd.DataFrame({"Ticker": list("ABCDE"),
+                              "MarketCap": [1e9, 2e9, float("nan"), float("nan"), float("nan")]})
+        self.assertTrue(has_usable_market_cap(frame, 2))
+        self.assertFalse(has_usable_market_cap(frame, 3))
+        self.assertFalse(has_usable_market_cap(pd.DataFrame({"Ticker": ["A"]}), 1))
+
+    def test_exclude_largest_by_turnover(self):
+        frame = pd.DataFrame({
+            "Ticker": ["BIG", "MID", "SMALL"],
+            "ADV60 (A$)": [50_000_000.0, 5_000_000.0, 300_000.0],
+        })
+        kept, dropped = exclude_largest(frame, 1, "ADV60 (A$)", "60-day turnover")
+        self.assertEqual(kept["Ticker"].tolist(), ["MID", "SMALL"])
+        self.assertEqual(dropped["Ticker"].tolist(), ["BIG"])
+        self.assertEqual(dropped["Reason"].iloc[0], "Top 1 by 60-day turnover")
+
+    def test_exclude_largest_ignores_unrankable_rows(self):
+        frame = pd.DataFrame({"Ticker": ["A", "B"], "MarketCap": [float("nan")] * 2})
+        kept, dropped = exclude_largest(frame, 1, "MarketCap", "market cap")
+        self.assertEqual(kept["Ticker"].tolist(), ["A", "B"])
+        self.assertTrue(dropped.empty)
+
+    def test_exclude_largest_is_a_noop_at_zero(self):
+        frame = pd.DataFrame({"Ticker": ["A"], "MarketCap": [1e9]})
+        kept, dropped = exclude_largest(frame, 0, "MarketCap", "market cap")
+        self.assertEqual(len(kept), 1)
+        self.assertTrue(dropped.empty)
+
+    def test_adv60_rides_out_a_single_block_trade(self):
+        # One 50x volume day moves ADV20 far more than ADV60.
+        volumes = [100_000.0] * 200 + [5_000_000.0]
+        row = compute_signals(series([10.0] * 201, volumes), CFG)
+        self.assertGreater(row["ADV20 (A$)"], row["ADV60 (A$)"])
+        self.assertAlmostEqual(row["ADV60 (A$)"], (59 * 1e6 + 5e7) / 60, places=4)
+
+
+class TestWorkbook(unittest.TestCase):
+    def test_all_empty_column_does_not_break_column_sizing(self):
+        # A bare ticker list yields no names and no market caps.
+        frame = pd.DataFrame({"Ticker": ["AAA"], "Name": [None], "MarketCap": [float("nan")]})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.xlsx"
+            write_workbook(path, frame, frame, frame, frame, frame)
+            self.assertTrue(path.exists())
+            self.assertEqual(
+                pd.ExcelFile(path).sheet_names,
+                ["Breakouts", "Breakdowns", "Sector RS", "Full universe", "Excluded"])
+
+    def test_empty_frames_still_produce_every_sheet(self):
+        empty = pd.DataFrame()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.xlsx"
+            write_workbook(path, empty, empty, empty, empty, empty)
+            self.assertEqual(len(pd.ExcelFile(path).sheet_names), 5)
 
 
 class TestYfinanceFrameShapes(unittest.TestCase):
