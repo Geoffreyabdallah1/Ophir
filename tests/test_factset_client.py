@@ -455,6 +455,43 @@ class TestTransport(unittest.TestCase):
             fs.get("/some/path")
         self.assertIn("gateway", str(caught.exception))
 
+    def test_content_prefix_is_on_every_endpoint(self):
+        """The gateway 404s without it, so pin the prefix on each wrapper."""
+        cases = [
+            (lambda c: c.prices("X-AU", start_date="2024-01-01"),
+             "/content/factset-global-prices/v1/prices"),
+            (lambda c: c.returns("X-AU", start_date="2024-01-01",
+                                 end_date="2024-02-01"),
+             "/content/factset-global-prices/v1/returns"),
+            (lambda c: c.corporate_actions("X-AU"),
+             "/content/factset-global-prices/v1/corporate-actions"),
+            (lambda c: c.shares_outstanding("X-AU"),
+             "/content/factset-global-prices/v1/shares-outstanding"),
+            (lambda c: c.fundamentals("X-AU", metrics=["FF_SALES"]),
+             "/content/factset-fundamentals/v2/fundamentals"),
+            (lambda c: c.fundamentals_metrics(),
+             "/content/factset-fundamentals/v2/metrics"),
+        ]
+        for call, expected in cases:
+            with self.subTest(path=expected):
+                fs, session = client([FakeResponse(200, {"data": []})])
+                call(fs)
+                self.assertEqual(session.calls[0]["url"],
+                                 "https://api.factset.com" + expected)
+
+    def test_html_error_page_is_summarised_not_quoted(self):
+        """FactSet's gateway answers unknown paths with HTML, not JSON."""
+        html = ('<html> <head> <title>Error</title> <link rel="stylesheet" '
+                'href="//cdn.factset.com/login/1.0.3/css/Error.css"> </head>'
+                '<body><div class="errorCenter">...</div></body></html>')
+        fs, _ = client([FakeResponse(404, None, text=html)])
+        with self.assertRaises(FactSetAPIError) as caught:
+            fs.get("/wrong/path")
+        message = str(caught.exception)
+        self.assertNotIn("stylesheet", message)
+        self.assertIn("HTML error page", message)
+        self.assertIn("/content", message)
+
     def test_context_manager_closes_only_owned_sessions(self):
         session = FakeSession([])
         with FactSetClient(token_provider=lambda: "t", session=session):
@@ -468,7 +505,7 @@ class TestEndpoints(unittest.TestCase):
         fs.prices("BHP-AU", start_date="2024-01-01", end_date="2024-03-01")
         call = session.calls[0]
         self.assertEqual(call["method"], "POST")
-        self.assertTrue(call["url"].endswith("/factset-global-prices/v1/prices"))
+        self.assertTrue(call["url"].endswith("/content/factset-global-prices/v1/prices"))
         data = call["body"]["data"]
         self.assertEqual(data["ids"], ["BHP-AU"])
         self.assertEqual(data["startDate"], "2024-01-01")
@@ -529,7 +566,7 @@ class TestEndpoints(unittest.TestCase):
         fs, session = client([FakeResponse(200, {"data": [{"totalReturn": 1.2}]})])
         fs.returns("BHP-AU", start_date="2024-01-01", end_date="2024-03-01")
         call = session.calls[0]
-        self.assertTrue(call["url"].endswith("/factset-global-prices/v1/returns"))
+        self.assertTrue(call["url"].endswith("/content/factset-global-prices/v1/returns"))
         self.assertEqual(call["body"]["data"]["endDate"], "2024-03-01")
 
     def test_corporate_actions_defaults_to_all_events(self):
@@ -542,7 +579,7 @@ class TestEndpoints(unittest.TestCase):
         fs, session = client([FakeResponse(200, {"data": [{"shares": 5.0}]})])
         fs.shares_outstanding("BHP-AU")
         self.assertTrue(session.calls[0]["url"]
-                        .endswith("/factset-global-prices/v1/shares-outstanding"))
+                        .endswith("/content/factset-global-prices/v1/shares-outstanding"))
 
     def test_fundamentals_sends_metrics_and_periodicity(self):
         fs, session = client([FakeResponse(200, {"data": [{"value": 1.0}]})])

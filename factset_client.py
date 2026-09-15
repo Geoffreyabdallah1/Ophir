@@ -464,8 +464,12 @@ def asx_symbols(codes: Iterable[str]) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 DEFAULT_BASE_URL = "https://api.factset.com"
-GLOBAL_PRICES = "/factset-global-prices/v1"
-FUNDAMENTALS = "/factset-fundamentals/v2"
+
+# FactSet's content APIs sit under a /content prefix. Without it the gateway
+# has no route to match and answers with an HTML error page rather than a JSON
+# API error, which is what a 404 carrying markup means here.
+GLOBAL_PRICES = "/content/factset-global-prices/v1"
+FUNDAMENTALS = "/content/factset-fundamentals/v2"
 
 # Global Prices caps a multi-day request at 50 ids.
 MAX_IDS_PER_REQUEST = 50
@@ -602,8 +606,12 @@ class FactSetClient:
                     "entitled to this endpoint."
                 )
 
+            message = _error_message(response)
+            if status == 404:
+                message += (" — check the endpoint path; FactSet content APIs "
+                            "live under /content")
             last_error = FactSetAPIError(
-                status, _error_message(response), url, _request_key(response)
+                status, message, url, _request_key(response)
             )
 
             if status in RETRY_STATUS and attempt < self.max_retries:
@@ -794,12 +802,25 @@ def _request_key(response: requests.Response) -> str | None:
     return headers.get("x-datadirect-request-key")
 
 
+def _looks_like_html(text: str) -> bool:
+    head = text.lstrip()[:200].lower()
+    return head.startswith(("<!doctype", "<html", "<head")) or "<html" in head
+
+
 def _error_message(response: requests.Response) -> str:
-    """Pull a readable message out of a FactSet error body."""
+    """Pull a readable message out of a FactSet error body.
+
+    An HTML body means the gateway answered instead of the API — almost always
+    a path it has no route for — so say that rather than quoting the markup.
+    """
     try:
         payload = response.json()
     except Exception:
         text = (getattr(response, "text", "") or "").strip()
+        if _looks_like_html(text):
+            return ("the gateway returned an HTML error page rather than a JSON "
+                    "API response, which usually means this path is not a "
+                    "recognised endpoint")
         return text[:300] or "no response body"
 
     if isinstance(payload, dict):
