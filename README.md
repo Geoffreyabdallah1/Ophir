@@ -128,9 +128,21 @@ That extra install is deliberate: the scanner itself doesn't need FactSet, so
 ### Credentials
 
 Register an application at [developer.factset.com](https://developer.factset.com)
-as a **confidential client** and download its JSON config. It carries your client
-id and an RSA private key, so it is a secret — keep it out of the repo. The
-client looks for it in this order:
+and download its JSON config. FactSet issues confidential clients in two
+flavours; the **Type** column on the API Authentication page says which you
+have, and both work here:
+
+| Portal type | Config carries | Extra install |
+| --- | --- | --- |
+| `... Machine Authorization (Key Pair)` | a `jwk` block holding an RSA private key | yes — signing helper |
+| `... Machine Authorization (Client Secret)` | a shared secret string | no |
+
+A Key Pair application signs a JWT to request its token, which needs FactSet's
+signing helper. A Client Secret application posts its secret to the token
+endpoint, which needs nothing beyond `requests` — `requirements-factset.txt` is
+optional in that case.
+
+Either way the config is a secret. The client looks for it in this order:
 
 1. the `config_path` argument,
 2. `$FACTSET_CONFIG_PATH`,
@@ -138,12 +150,42 @@ client looks for it in this order:
 4. `~/.factset/config.json`.
 
 ```bash
-export FACTSET_CONFIG_PATH=~/.factset/config.json
+mkdir -p ~/.factset && mv ~/Downloads/factset-*.json ~/.factset/config.json
 chmod 600 ~/.factset/config.json
+export FACTSET_CONFIG_PATH=~/.factset/config.json
 ```
 
+For a Client Secret application the portal shows the secret once, separately
+from the JSON. Either add it to the config as `"clientSecret"`, or — better —
+keep it out of the file entirely:
+
+```bash
+export FACTSET_CLIENT_SECRET='...'
+```
+
+`$FACTSET_CLIENT_SECRET` wins over the file when both are set.
+
 `factset.json` and `factset-*.json` are gitignored. Nothing in the module logs,
-prints or echoes the file's contents.
+prints or echoes credentials, and `--check` reports that a token was obtained
+without ever printing it.
+
+### Checking the connection
+
+```bash
+python factset_client.py --check
+```
+
+Walks the three things that can be wrong, in order, and exits non-zero at the
+first failure:
+
+```
+1. Credentials    config found, client id, which flavour, where the secret came from
+2. Authentication a token was obtained, and when it expires
+3. Data access    a real price call, confirming entitlements
+```
+
+`--config` points at a config elsewhere; `--symbol` changes the symbol used for
+the data check, which matters if your entitlements don't cover Australia.
 
 ### Use
 
@@ -201,7 +243,10 @@ column orderings, a single flat-column ticker, a partly failed batch, and an
 covered, since it needs live access to Yahoo.
 
 The FactSet client is covered too, against a fake transport: credentials validation
-and its error messages, bearer auth, id batching at 50, retry and backoff on `429`
-and `5xx`, `401`/`403` raising immediately, error-body parsing, and the request body
-of each endpoint wrapper. The OAuth exchange itself is not covered — it needs real
-credentials and outbound access to FactSet.
+for both flavours and its error messages, bearer auth, id batching at 50, retry and
+backoff on `429` and `5xx`, `401`/`403` raising immediately, error-body parsing, and
+the request body of each endpoint wrapper. The client-secret flow is covered end to
+end — metadata discovery, the form-post token exchange, the Basic-auth fallback,
+token caching and renewal before expiry, and a rejected secret. What is not covered
+is a real exchange with FactSet's own authorization server, which needs live
+credentials and outbound access.

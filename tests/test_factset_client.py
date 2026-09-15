@@ -14,11 +14,16 @@ import unittest.mock
 from pathlib import Path
 
 import pandas as pd
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from factset_client import (  # noqa: E402
     FactSetAPIError,
+    build_token_provider,
+    client_secret_token_provider,
+    credential_flavour,
+    resolve_client_secret,
     FactSetAuthError,
     FactSetClient,
     FactSetConfigError,
@@ -35,6 +40,17 @@ FAKE_JWK = {key: "x" for key in
 FAKE_CONFIG = {"name": "test app", "clientId": "test-client",
                "clientAuthType": "Confidential", "jwk": FAKE_JWK}
 
+# The other flavour: a client-secret application, as issued to accounts whose
+# portal Type column reads "Machine Authorization (Client Secret)".
+SECRET_CONFIG = {"name": "test app", "clientId": "test-client",
+                 "clientAuthType": "Confidential Client Application - "
+                                   "Machine Authorization",
+                 "clientSecret": "s3cret",
+                 "wellKnownUri": "https://auth.example/.well-known/openid-configuration"}
+
+META = {"issuer": "https://auth.example",
+        "token_endpoint": "https://auth.example/as/token.oauth2"}
+
 
 class FakeResponse:
     def __init__(self, status_code=200, payload=None, headers=None, text=""):
@@ -48,6 +64,34 @@ class FakeResponse:
         if self._payload is None:
             raise ValueError("no JSON body")
         return self._payload
+
+
+class FakeFormSession:
+    """Fake for the token endpoint: records GET metadata and POST form bodies.
+
+    A queued entry that is an exception is raised instead of returned, which is
+    how the unreachable-server case is exercised.
+    """
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def _next(self, record):
+        self.calls.append(record)
+        if not self.responses:
+            raise AssertionError(f"unexpected extra request to {record['url']}")
+        reply = self.responses.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    def get(self, url, timeout=None):
+        return self._next({"method": "GET", "url": url, "timeout": timeout})
+
+    def post(self, url, data=None, auth=None, headers=None, timeout=None):
+        return self._next({"method": "POST", "url": url, "data": data,
+                           "auth": auth, "headers": headers, "timeout": timeout})
 
 
 class FakeSession:
@@ -166,6 +210,173 @@ class TestConfig(unittest.TestCase):
             with self.assertRaises(FactSetConfigError) as caught:
                 find_config_path()
         self.assertIn("FACTSET_CONFIG_PATH", str(caught.exception))
+
+
+class TestClientSecretFlow(unittest.TestCase):
+    """The client-secret flavour: a plain form post, no JWT signing."""
+
+    def setUp(self):
+        self.clock = [1000.0]
+
+    def provider(self, responses, config=None, **kwargs):
+        session = FakeFormSession(responses)
+        return client_secret_token_provider(
+            config=config or dict(SECRET_CONFIG),
+            session=session,
+            clock=lambda: self.clock[0],
+            **kwargs,
+        ), session
+
+    def test_flavour_detection(self):
+        self.assertEqual(credential_flavour(FAKE_CONFIG), "key-pair")
+        self.assertEqual(credential_flavour(SECRET_CONFIG), "client-secret")
+
+    def test_token_is_fetched_from_the_discovered_endpoint(self):
+        get_token, session = self.provider(
+            [FakeResponse(200, META),
+             FakeResponse(200, {"access_token": "tok-1", "expires_in": 900})])
+        self.assertEqual(get_token(), "tok-1")
+        self.assertEqual(session.calls[0]["url"], SECRET_CONFIG["wellKnownUri"])
+        self.assertEqual(session.calls[1]["url"], META["token_endpoint"])
+
+    def test_credentials_are_sent_in_the_form_body(self):
+        get_token, session = self.provider(
+            [FakeResponse(200, META),
+             FakeResponse(200, {"access_token": "tok-1", "expires_in": 900})])
+        get_token()
+        body = session.calls[1]["data"]
+        self.assertEqual(body["grant_type"], "client_credentials")
+        self.assertEqual(body["client_id"], "test-client")
+        self.assertEqual(body["client_secret"], "s3cret")
+        self.assertIsNone(session.calls[1]["auth"])
+
+    def test_falls_back_to_basic_auth_on_401(self):
+        get_token, session = self.provider(
+            [FakeResponse(200, META),
+             FakeResponse(401, {"error": "invalid_client"}),
+             FakeResponse(200, {"access_token": "tok-basic", "expires_in": 900})])
+        self.assertEqual(get_token(), "tok-basic")
+        self.assertEqual(session.calls[2]["auth"], ("test-client", "s3cret"))
+        self.assertNotIn("client_secret", session.calls[2]["data"])
+
+    def test_token_is_cached_until_close_to_expiry(self):
+        get_token, session = self.provider(
+            [FakeResponse(200, META),
+             FakeResponse(200, {"access_token": "tok-1", "expires_in": 900})])
+        self.assertEqual(get_token(), "tok-1")
+        self.clock[0] += 600
+        self.assertEqual(get_token(), "tok-1")
+        self.assertEqual(len(session.calls), 2)  # nothing re-fetched
+
+    def test_token_is_renewed_before_it_expires(self):
+        get_token, session = self.provider(
+            [FakeResponse(200, META),
+             FakeResponse(200, {"access_token": "tok-1", "expires_in": 900}),
+             FakeResponse(200, {"access_token": "tok-2", "expires_in": 900})])
+        self.assertEqual(get_token(), "tok-1")
+        self.clock[0] += 880  # inside the 30s renewal margin
+        self.assertEqual(get_token(), "tok-2")
+
+    def test_endpoint_is_discovered_only_once(self):
+        get_token, session = self.provider(
+            [FakeResponse(200, META),
+             FakeResponse(200, {"access_token": "tok-1", "expires_in": 900}),
+             FakeResponse(200, {"access_token": "tok-2", "expires_in": 900})])
+        get_token()
+        self.clock[0] += 880
+        get_token()
+        well_known = [c for c in session.calls
+                      if c["url"] == SECRET_CONFIG["wellKnownUri"]]
+        self.assertEqual(len(well_known), 1)
+
+    def test_secret_can_come_from_the_environment(self):
+        config = {k: v for k, v in SECRET_CONFIG.items() if k != "clientSecret"}
+        with unittest.mock.patch.dict("os.environ",
+                                      {"FACTSET_CLIENT_SECRET": "from-env"}):
+            self.assertEqual(resolve_client_secret(config), "from-env")
+            get_token, session = self.provider(
+                [FakeResponse(200, META),
+                 FakeResponse(200, {"access_token": "t", "expires_in": 60})],
+                config=config)
+            get_token()
+        self.assertEqual(session.calls[1]["data"]["client_secret"], "from-env")
+
+    def test_environment_secret_overrides_the_file(self):
+        with unittest.mock.patch.dict("os.environ",
+                                      {"FACTSET_CLIENT_SECRET": "wins"}):
+            self.assertEqual(resolve_client_secret(SECRET_CONFIG), "wins")
+
+    def test_missing_secret_is_reported(self):
+        config = {k: v for k, v in SECRET_CONFIG.items() if k != "clientSecret"}
+        with unittest.mock.patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(FactSetConfigError) as caught:
+                client_secret_token_provider(config=config,
+                                             session=FakeFormSession([]))
+        self.assertIn("FACTSET_CLIENT_SECRET", str(caught.exception))
+
+    def test_rejected_credentials_raise_auth_error(self):
+        get_token, _ = self.provider(
+            [FakeResponse(200, META),
+             FakeResponse(400, {"error_description": "bad secret"}),
+             FakeResponse(400, {"error_description": "bad secret"})])
+        with self.assertRaises(FactSetAuthError) as caught:
+            get_token()
+        self.assertIn("bad secret", str(caught.exception))
+
+    def test_token_response_without_a_token_is_an_error(self):
+        get_token, _ = self.provider(
+            [FakeResponse(200, META), FakeResponse(200, {"expires_in": 900})])
+        with self.assertRaises(FactSetAuthError) as caught:
+            get_token()
+        self.assertIn("access_token", str(caught.exception))
+
+    def test_metadata_without_a_token_endpoint_is_an_error(self):
+        get_token, _ = self.provider(
+            [FakeResponse(200, {"issuer": "https://auth.example"})])
+        with self.assertRaises(FactSetAuthError) as caught:
+            get_token()
+        self.assertIn("token_endpoint", str(caught.exception))
+
+    def test_unreachable_auth_server_is_an_auth_error(self):
+        session = FakeFormSession([requests.ConnectionError("blocked")])
+        get_token = client_secret_token_provider(
+            config=dict(SECRET_CONFIG), session=session,
+            clock=lambda: self.clock[0])
+        with self.assertRaises(FactSetAuthError) as caught:
+            get_token()
+        self.assertIn("Could not reach", str(caught.exception))
+
+    def test_missing_expires_in_still_caches_briefly(self):
+        get_token, _ = self.provider(
+            [FakeResponse(200, META), FakeResponse(200, {"access_token": "t"})])
+        get_token()
+        self.assertEqual(get_token.expires_at(), 1000.0 + 300.0)
+
+    def test_dispatcher_picks_the_client_secret_path(self):
+        session = FakeFormSession(
+            [FakeResponse(200, META),
+             FakeResponse(200, {"access_token": "tok", "expires_in": 60})])
+        provider = build_token_provider(config=dict(SECRET_CONFIG),
+                                        session=session)
+        self.assertEqual(provider(), "tok")
+
+    def test_secret_config_passes_validation(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "factset.json"
+            path.write_text(json.dumps(SECRET_CONFIG), encoding="utf-8")
+            self.assertEqual(load_config(path)["clientId"], "test-client")
+
+    def test_config_with_neither_credential_is_reported(self):
+        bare = {k: v for k, v in SECRET_CONFIG.items() if k != "clientSecret"}
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "factset.json"
+            path.write_text(json.dumps(bare), encoding="utf-8")
+            with unittest.mock.patch.dict("os.environ", {}, clear=True):
+                with self.assertRaises(FactSetConfigError) as caught:
+                    load_config(path)
+        message = str(caught.exception)
+        self.assertIn("jwk", message)
+        self.assertIn("clientSecret", message)
 
 
 class TestTransport(unittest.TestCase):
