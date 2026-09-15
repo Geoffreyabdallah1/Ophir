@@ -169,6 +169,19 @@ export FACTSET_CLIENT_SECRET='...'
 prints or echoes credentials, and `--check` reports that a token was obtained
 without ever printing it.
 
+### Setup
+
+```bash
+./setup_factset.sh
+```
+
+Prompts for the Client ID and Secret from developer.factset.com, writes them to
+`~/.factset/config.json` with owner-only permissions, and runs the connection
+check. That is one of the paths the client searches by default, so there are no
+environment variables to export and no shell profile to edit — it keeps working
+in every new terminal. The secret is read without echoing and never reaches your
+shell history.
+
 ### Checking the connection
 
 ```bash
