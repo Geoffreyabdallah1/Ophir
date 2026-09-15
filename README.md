@@ -200,6 +200,28 @@ first failure:
 `--config` points at a config elsewhere; `--symbol` changes the symbol used for
 the data check, which matters if your entitlements don't cover Australia.
 
+### What your account can reach
+
+```bash
+python factset_client.py --probe
+```
+
+Tries each endpoint and reports which are licensed. Authentication is shared
+across all of them, so once `--check` reaches step 2 a `403` here is a licensing
+answer rather than a credentials one — the token was accepted and the endpoint
+refused it:
+
+```
+  --  Global Prices: prices                NOT entitled
+  ok  Fundamentals: fundamentals           entitled
+```
+
+A `400` counts as entitled: the API read the request and disliked its
+arguments, which it could only do after letting you in. Quote the exact paths
+to your FactSet account team — entitlements are per-serial, so an endpoint
+available elsewhere in your firm is not necessarily attached to the serial this
+application authenticates as.
+
 ### Use
 
 ```python

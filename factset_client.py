@@ -936,6 +936,79 @@ def check(config_path: str | os.PathLike | None = None,
     return 0
 
 
+def probe(config_path: str | os.PathLike | None = None) -> int:
+    """Report which endpoints this account is entitled to.
+
+    Authentication is shared, so a 403 here is a licensing answer rather than a
+    credentials one: the token was accepted and the endpoint refused it. A 400
+    still counts as entitled — the API read the request and disliked its
+    arguments, which it could only do after letting us in.
+    """
+    import datetime as _dt
+
+    try:
+        config = load_config(config_path)
+    except FactSetConfigError as exc:
+        print(f"error: {exc}")
+        return 1
+
+    today = _dt.date.today()
+    recent = (today - _dt.timedelta(days=7)).isoformat()
+    ident = ["IBM-US"]
+
+    checks: list[tuple[str, str, str, dict[str, Any] | None]] = [
+        ("Global Prices: prices", "POST", f"{GLOBAL_PRICES}/prices",
+         {"data": {"ids": ident, "startDate": recent,
+                   "endDate": today.isoformat(), "frequency": "D"}}),
+        ("Global Prices: returns", "POST", f"{GLOBAL_PRICES}/returns",
+         {"data": {"ids": ident, "startDate": recent,
+                   "endDate": today.isoformat(), "frequency": "D"}}),
+        ("Global Prices: corporate actions", "POST",
+         f"{GLOBAL_PRICES}/corporate-actions",
+         {"data": {"ids": ident, "startDate": recent,
+                   "endDate": today.isoformat()}}),
+        ("Global Prices: shares outstanding", "POST",
+         f"{GLOBAL_PRICES}/shares-outstanding", {"data": {"ids": ident}}),
+        ("Fundamentals: metrics", "GET", f"{FUNDAMENTALS}/metrics", None),
+        ("Fundamentals: fundamentals", "POST", f"{FUNDAMENTALS}/fundamentals",
+         {"data": {"ids": ident, "metrics": ["FF_SALES"],
+                   "periodicity": "ANN"}}),
+    ]
+
+    print(f"Entitlement probe for {config['clientId']}\n")
+    entitled: list[str] = []
+    refused: list[str] = []
+
+    with FactSetClient(config=config, max_retries=0) as client:
+        for label, method, path, body in checks:
+            try:
+                client.request(method, path, body=body)
+                verdict, bucket = "entitled", entitled
+            except FactSetAuthError:
+                # 401/403 after a good token means this endpoint is not licensed.
+                verdict, bucket = "NOT entitled", refused
+            except FactSetAPIError as exc:
+                if exc.status_code == 400:
+                    verdict, bucket = "entitled", entitled
+                elif exc.status_code == 404:
+                    verdict, bucket = "no such path", refused
+                else:
+                    verdict, bucket = f"error {exc.status_code}", refused
+            except FactSetError as exc:
+                print(f"  {label:36} could not check: {exc}")
+                continue
+            bucket.append(label)
+            mark = "ok  " if bucket is entitled else "--  "
+            print(f"  {mark}{label:36} {verdict}")
+
+    print(f"\n{len(entitled)} of {len(checks)} endpoints available.")
+    if refused and not entitled:
+        print("\nAuthentication works, so this is a licensing question, not a "
+              "credentials one. Quote the exact endpoint paths above to your "
+              "FactSet account team.")
+    return 0 if entitled else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
 
@@ -944,6 +1017,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--check", action="store_true",
                         help="verify credentials, authentication and entitlements")
+    parser.add_argument("--probe", action="store_true",
+                        help="report which endpoints this account is entitled to")
     parser.add_argument("--config", default=None,
                         help="path to the FactSet OAuth config "
                              f"(default: ${CONFIG_ENV_VAR}, ./factset.json, "
@@ -953,6 +1028,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                              "(default: BHP-AU)")
     args = parser.parse_args(argv)
 
+    if args.probe:
+        return probe(config_path=args.config)
     if not args.check:
         parser.print_help()
         return 0
