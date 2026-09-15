@@ -111,6 +111,80 @@ raise `--pause` (default 1 second between batches). `--limit N` scans only the
 first N names, which is the quickest way to check the download path works before
 committing to the full universe.
 
+## FactSet
+
+`factset_client.py` is a standalone client for the FactSet API — independent of
+the scanner, usable on its own. It handles OAuth 2.0 authentication and wraps
+Global Prices and Fundamentals, with a generic escape hatch for anything else
+under `api.factset.com`.
+
+```bash
+pip install -r requirements-factset.txt
+```
+
+That extra install is deliberate: the scanner itself doesn't need FactSet, so
+`requirements.txt` stays lean.
+
+### Credentials
+
+Register an application at [developer.factset.com](https://developer.factset.com)
+as a **confidential client** and download its JSON config. It carries your client
+id and an RSA private key, so it is a secret — keep it out of the repo. The
+client looks for it in this order:
+
+1. the `config_path` argument,
+2. `$FACTSET_CONFIG_PATH`,
+3. `./factset.json`,
+4. `~/.factset/config.json`.
+
+```bash
+export FACTSET_CONFIG_PATH=~/.factset/config.json
+chmod 600 ~/.factset/config.json
+```
+
+`factset.json` and `factset-*.json` are gitignored. Nothing in the module logs,
+prints or echoes the file's contents.
+
+### Use
+
+```python
+from factset_client import FactSetClient, asx_symbols
+
+with FactSetClient() as fs:
+    prices = fs.prices(asx_symbols(["SXE", "SLC", "IPG"]),
+                       start_date="2024-01-01", end_date="2024-12-31")
+    actions = fs.corporate_actions("BHP-AU", event_category="SPLITS")
+    sales = fs.fundamentals("BHP-AU", metrics=["FF_SALES"], periodicity="ANN")
+```
+
+Every wrapper returns a DataFrame. `asx_symbol` maps an ASX code to FactSet's
+ticker-region form — `SXE` becomes `SXE-AU` — and leaves an already-qualified
+symbol alone.
+
+| Method | Endpoint |
+| --- | --- |
+| `prices` | OHLCV history, with frequency, currency and split adjustment. |
+| `returns` | Period-by-period total returns. |
+| `corporate_actions` | Dividends, splits, spinoffs, rights. |
+| `shares_outstanding` | Historical share counts. |
+| `fundamentals` | Financial statement data for `FF_*` metric codes. |
+| `fundamentals_metrics` | The metric catalogue, for looking codes up first. |
+| `get` / `post` | Any other FactSet path. |
+
+Id lists are split into batches of 50 — the Global Prices ceiling for multi-day
+requests — and stacked back into one frame, so a full universe is a single call.
+`429` and `5xx` are retried with backoff, honouring `Retry-After`. A `401` or
+`403` raises `FactSetAuthError` immediately rather than retrying, since a
+credential or entitlement problem won't resolve itself.
+
+### Network access
+
+FactSet is reached over `api.factset.com` and `auth.factset.com`. On a
+restricted network both fail at the proxy with
+`CONNECT tunnel failed, response 403`, the same way the Yahoo download does, and
+no data comes back. Those two hosts need to be allowed outbound wherever this
+runs.
+
 ## Tests
 
 ```bash
@@ -125,3 +199,9 @@ that sits between `yfinance` and the signal pass is covered too: both MultiIndex
 column orderings, a single flat-column ticker, a partly failed batch, and an
 `Adj Close` column arriving alongside `Close`. The network call itself is not
 covered, since it needs live access to Yahoo.
+
+The FactSet client is covered too, against a fake transport: credentials validation
+and its error messages, bearer auth, id batching at 50, retry and backoff on `429`
+and `5xx`, `401`/`403` raising immediately, error-body parsing, and the request body
+of each endpoint wrapper. The OAuth exchange itself is not covered — it needs real
+credentials and outbound access to FactSet.

@@ -8,3 +8,8 @@ asx_breakout_scan_*.xlsx
 *.xlsx
 prices*.csv
 asx_universe.csv
+
+# FactSet OAuth credentials — contains a private key, never commit
+factset.json
+factset-*.json
+*-factset-config.json

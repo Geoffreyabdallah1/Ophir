@@ -1,0 +1,11 @@
+# Optional extras for factset_client.py. The breakout scanner does not need
+# these — install them only if you are pulling data from the FactSet API.
+#
+#   pip install -r requirements-factset.txt
+
+# FactSet's OAuth 2.0 confidential-client helper: signs the JWS with the
+# private key in the credentials file and exchanges it for a bearer token.
+fds.sdk.utils>=3.0,<4
+
+requests>=2.31
+pandas>=2.0
