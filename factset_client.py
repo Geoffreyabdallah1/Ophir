@@ -733,9 +733,13 @@ class FactSetClient:
         frequency: str | None = None,
         calendar: str | None = None,
     ) -> pd.DataFrame:
-        """Historical share counts — the other half of a market cap."""
+        """Historical share counts — the other half of a market cap.
+
+        Served by ``/security-shares``; there is no ``/shares-outstanding``
+        route, and asking for one returns a gateway 404 rather than a 403.
+        """
         return self._batched_post(
-            f"{GLOBAL_PRICES}/shares-outstanding",
+            f"{GLOBAL_PRICES}/security-shares",
             _as_id_list(ids),
             {
                 "startDate": start_date,
@@ -968,7 +972,7 @@ def probe(config_path: str | os.PathLike | None = None) -> int:
          {"data": {"ids": ident, "startDate": recent,
                    "endDate": today.isoformat()}}),
         ("Global Prices: shares outstanding", "POST",
-         f"{GLOBAL_PRICES}/shares-outstanding", {"data": {"ids": ident}}),
+         f"{GLOBAL_PRICES}/security-shares", {"data": {"ids": ident}}),
         ("Fundamentals: metrics", "GET", f"{FUNDAMENTALS}/metrics", None),
         ("Fundamentals: fundamentals", "POST", f"{FUNDAMENTALS}/fundamentals",
          {"data": {"ids": ident, "metrics": ["FF_SALES"],

@@ -466,7 +466,7 @@ class TestTransport(unittest.TestCase):
             (lambda c: c.corporate_actions("X-AU"),
              "/content/factset-global-prices/v1/corporate-actions"),
             (lambda c: c.shares_outstanding("X-AU"),
-             "/content/factset-global-prices/v1/shares-outstanding"),
+             "/content/factset-global-prices/v1/security-shares"),
             (lambda c: c.fundamentals("X-AU", metrics=["FF_SALES"]),
              "/content/factset-fundamentals/v2/fundamentals"),
             (lambda c: c.fundamentals_metrics(),
@@ -579,7 +579,7 @@ class TestEndpoints(unittest.TestCase):
         fs, session = client([FakeResponse(200, {"data": [{"shares": 5.0}]})])
         fs.shares_outstanding("BHP-AU")
         self.assertTrue(session.calls[0]["url"]
-                        .endswith("/content/factset-global-prices/v1/shares-outstanding"))
+                        .endswith("/content/factset-global-prices/v1/security-shares"))
 
     def test_fundamentals_sends_metrics_and_periodicity(self):
         fs, session = client([FakeResponse(200, {"data": [{"value": 1.0}]})])
